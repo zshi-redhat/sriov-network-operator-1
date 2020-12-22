@@ -105,10 +105,11 @@ type workItem struct {
 }
 
 const (
-	scriptsPath  = "/bindata/scripts/enable-rdma.sh"
-	annoKey      = "sriovnetwork.openshift.io/state"
-	annoIdle     = "Idle"
-	annoDraining = "Draining"
+	rdmaScriptsPath = "/bindata/scripts/enable-rdma.sh"
+	udevScriptsPath = "/bindata/scripts/load-udev.sh"
+	annoKey         = "sriovnetwork.openshift.io/state"
+	annoIdle        = "Idle"
+	annoDraining    = "Draining"
 )
 
 var namespace = os.Getenv("NAMESPACE")
@@ -201,6 +202,20 @@ func (dn *Daemon) annotateUnsupportedNicIdConfigMap(cm *v1.ConfigMap, nodeName s
 
 func (dn *Daemon) tryCreateUdevRuleWrapper() error {
 	var unsupportedNicIdMap map[string]string
+
+	ns, nodeStateErr := dn.client.SriovnetworkV1().SriovNetworkNodeStates(namespace).Get(
+		context.Background(),
+		dn.name,
+		metav1.GetOptions{},
+	)
+	if nodeStateErr != nil {
+		glog.Warningf("Could not fetch node state %s: %v, skip updating switchdev udev rules", dn.name, nodeStateErr)
+	} else {
+		err := tryCreateSwitchdevUdevRule(ns)
+		if err != nil {
+			glog.Warningf("Failed to create switchdev udev rules: %v", err)
+		}
+	}
 
 	// retrieve config map
 	cm, configMapErr := dn.getUnsupportedNicIdConfigMap()
@@ -800,7 +815,7 @@ func tryEnableRdma() (bool, error) {
 	glog.V(2).Infof("tryEnableRdma()")
 	var stdout, stderr bytes.Buffer
 
-	cmd := exec.Command("/bin/bash", scriptsPath)
+	cmd := exec.Command("/bin/bash", rdmaScriptsPath)
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -820,6 +835,64 @@ func tryEnableRdma() (bool, error) {
 		}
 	}
 	return false, err
+}
+
+func tryCreateSwitchdevUdevRule(nodeState *sriovnetworkv1.SriovNetworkNodeState) error {
+	glog.V(2).Infof("tryCreateSwitchdevUdevRule()")
+	var new_content string
+	filePath := "/host/etc/udev/rules.d/20-switchdev.rules"
+
+	for _, ifaceStatus := range nodeState.Status.Interfaces {
+		if ifaceStatus.EswitchMode == sriovnetworkv1.ESWITCHMODE_SWITCHDEV {
+			switchID, err := utils.GetPhysSwitchID(ifaceStatus.Name)
+			if err != nil {
+				return err
+			}
+			portName, err := utils.GetPhysPortName(ifaceStatus.Name)
+			if err != nil {
+				return err
+			}
+			new_content = new_content + fmt.Sprintf("SUBSYSTEM==\"net\", ACTION==\"add|move\", ATTRS{phys_switch_id}==\"%s\", ATTR{phys_port_name}==\"pf%svf*\", IMPORT{program}=\"/etc/udev/switchdev-vf-link-name.sh $attr{phys_port_name}\", NAME=\"%s_$env{NUMBER}\"\n", switchID, strings.TrimPrefix(portName, "p"), ifaceStatus.Name)
+		}
+	}
+
+	old_content, err := ioutil.ReadFile(filePath)
+	// if old_content = new_content, don't do anything
+	if err == nil && new_content == string(old_content) {
+		return nil
+	}
+
+	glog.V(2).Infof("Old udev content '%v' and new content '%v' differ. Writing to file %v.",
+		strings.TrimSuffix(string(old_content), "\n"),
+		strings.TrimSuffix(new_content, "\n"),
+		filePath)
+
+	// if the file does not exist or if old_content != new_content
+	// write to file and create it if it doesn't exist
+	err = ioutil.WriteFile(filePath, []byte(new_content), 0666)
+	if err != nil {
+		glog.Errorf("tryCreateUdevRule(): fail to write file: %v", err)
+		return err
+	}
+
+	var stdout, stderr bytes.Buffer
+	cmd := exec.Command("/bin/bash", udevScriptsPath)
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return err
+	}
+	glog.V(2).Infof("tryCreateSwitchdevUdevRule(): %v", cmd.Stdout)
+
+	i, err := strconv.Atoi(strings.TrimSpace(stdout.String()))
+	if err == nil {
+		if i == 0 {
+			glog.V(2).Infof("tryCreateSwitchdevUdevRule(): switchdev udev rules loaded")
+		} else {
+			glog.V(2).Infof("tryCreateSwitchdevUdevRule(): switchdev udev rules not loaded")
+		}
+	}
+	return nil
 }
 
 func tryCreateUdevRule(unsupportedNicIdMap map[string]string) error {
