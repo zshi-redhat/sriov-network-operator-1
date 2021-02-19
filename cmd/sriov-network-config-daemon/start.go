@@ -16,6 +16,7 @@ import (
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/daemon"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/utils"
 	"github.com/k8snetworkplumbingwg/sriov-network-operator/pkg/version"
+	"github.com/RHsyseng/operator-utils/pkg/utils/openshift"
 	"github.com/spf13/cobra"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -116,6 +117,11 @@ func runStartCmd(cmd *cobra.Command, args []string) {
 
 	if err != nil {
 		panic(err.Error())
+	}
+
+	platformName, err := openshift.GetPlatformName(config)
+	if err != nil {
+		glog.Errorf("failed to get platform name: %v", err)
 	}
 
 	closeAllConns, err := updateDialer(config)
