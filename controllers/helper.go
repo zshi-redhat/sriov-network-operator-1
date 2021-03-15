@@ -37,6 +37,7 @@ const (
 	CONFIGMAP_NAME                   = "device-plugin-config"
 	DP_CONFIG_FILENAME               = "config.json"
 	HwOffloadNodeLabel               = "ovs-hw-offload-worker"
+	HwOffloadMCPAnnotationKey        = "sriovnetwork.openshift.io/ovs-hw-offload-mcp"
 
 	linkTypeEthernet   = "ether"
 	linkTypeInfiniband = "infiniband"

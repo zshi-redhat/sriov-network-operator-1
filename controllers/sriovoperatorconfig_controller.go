@@ -19,6 +19,7 @@ package controllers
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 
@@ -413,14 +414,11 @@ func (r *SriovOperatorConfigReconciler) syncOffloadMachineConfig(dc *sriovnetwor
 	var err error
 
 	logger.Info("Start to render MachineConfig and MachineConfigPool for OVS HW offloading")
+
 	data := render.MakeRenderData()
 	data.Data["HwOffloadNodeLabel"] = HwOffloadNodeLabel
-	mcName := "00-" + HwOffloadNodeLabel
 	mcpName := HwOffloadNodeLabel
-	mc, err := render.GenerateMachineConfig("bindata/manifests/switchdev-config", mcName, HwOffloadNodeLabel, dc.Spec.EnableOvsOffload, &data)
-	if err != nil {
-		return err
-	}
+
 	mcpRaw, err := render.RenderTemplate("bindata/manifests/switchdev-config/machineconfigpool.yaml", &data)
 	if err != nil {
 		return err
@@ -434,42 +432,7 @@ func (r *SriovOperatorConfigReconciler) syncOffloadMachineConfig(dc *sriovnetwor
 		return err
 	}
 
-	foundMC := &mcfgv1.MachineConfig{}
 	foundMCP := &mcfgv1.MachineConfigPool{}
-
-	err = r.Get(context.TODO(), types.NamespacedName{Name: mcName}, foundMC)
-	if err != nil {
-		if errors.IsNotFound(err) {
-			if dc.Spec.EnableOvsOffload {
-				err = r.Create(context.TODO(), mc)
-				if err != nil {
-					return fmt.Errorf("Couldn't create MachineConfig: %v", err)
-				}
-				logger.Info("Created MachineConfig CR")
-			}
-		} else {
-			return fmt.Errorf("Failed to get MachineConfig: %v", err)
-		}
-	} else {
-		if dc.Spec.EnableOvsOffload {
-			if bytes.Compare(foundMC.Spec.Config.Raw, mc.Spec.Config.Raw) == 0 {
-				logger.Info("MachineConfig already exists, updating")
-				err = r.Update(context.TODO(), foundMC)
-				if err != nil {
-					return fmt.Errorf("Couldn't update MachineConfig: %v", err)
-				}
-			} else {
-				logger.Info("No content change, skip updating MC")
-			}
-		} else {
-			logger.Info("offload disabled, delete MachineConfig")
-			err = r.Delete(context.TODO(), foundMC)
-			if err != nil {
-				return fmt.Errorf("Couldn't delete MachineConfig: %v", err)
-			}
-		}
-	}
-
 	err = r.Get(context.TODO(), types.NamespacedName{Name: mcpName}, foundMCP)
 	if err != nil {
 		if errors.IsNotFound(err) {
@@ -504,5 +467,101 @@ func (r *SriovOperatorConfigReconciler) syncOffloadMachineConfig(dc *sriovnetwor
 			}
 		}
 	}
+
+	mcpMap := make(map[string][]string)
+	mcpJson, ok := dc.ObjectMeta.Annotations[HwOffloadMCPAnnotationKey]
+	if !ok {
+		logger.Info("OVS hardware offload machine config pool annotation is not defined")
+		mcpMap["default"] = []string{HwOffloadNodeLabel}
+	} else {
+		err := json.Unmarshal([]byte(mcpJson), &mcpMap)
+		if err != nil {
+			return fmt.Errorf("Couldn't unmarshal ovs hardware offload machine config pool annotation: %v", err)
+		}
+		mcpMap["default"] = append(mcpMap["default"], HwOffloadNodeLabel)
+	}
+
+	// make sure MCPs defined in HwOffloadMCPAnnotation exist
+	mcpList := &mcfgv1.MachineConfigPoolList{}
+	err = r.List(context.TODO(), mcpList, &client.ListOptions{})
+	for _, mcpName := range mcpMap["default"] {
+		found := false
+		for _, mcp := range mcpList.Items {
+			if mcpName == mcp.Name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("MachineConfigPool %s doesn't exist in the cluster", mcpName)
+		}
+	}
+
+	for _, mcpName := range mcpMap["default"] {
+		mcName := "00-" + mcpName + HwOffloadNodeLabel
+		mc, err := render.GenerateMachineConfig("bindata/manifests/switchdev-config", mcName, mcpName, dc.Spec.EnableOvsOffload, &data)
+		if err != nil {
+			return err
+		}
+
+		foundMC := &mcfgv1.MachineConfig{}
+		err = r.Get(context.TODO(), types.NamespacedName{Name: mcName}, foundMC)
+		if err != nil {
+			if errors.IsNotFound(err) {
+				if dc.Spec.EnableOvsOffload {
+					err = r.Create(context.TODO(), mc)
+					if err != nil {
+						return fmt.Errorf("Couldn't create MachineConfig: %v", err)
+					}
+					logger.Info("Created MachineConfig CR")
+				}
+			} else {
+				return fmt.Errorf("Failed to get MachineConfig: %v", err)
+			}
+		} else {
+			if dc.Spec.EnableOvsOffload {
+				if bytes.Compare(foundMC.Spec.Config.Raw, mc.Spec.Config.Raw) == 0 {
+					logger.Info("MachineConfig already exists, updating")
+					err = r.Update(context.TODO(), foundMC)
+					if err != nil {
+						return fmt.Errorf("Couldn't update MachineConfig: %v", err)
+					}
+				} else {
+					logger.Info("No content change, skip updating MC")
+				}
+			} else {
+				logger.Info("offload disabled, delete MachineConfig")
+				err = r.Delete(context.TODO(), foundMC)
+				if err != nil {
+					return fmt.Errorf("Couldn't delete MachineConfig: %v", err)
+				}
+			}
+		}
+	}
+
+	// remove legacy MCs for MCPs that don't exist in HwOffloadMCPAnnotation
+	for _, mcp := range mcpList.Items {
+		found := false
+		for _, mcpName := range mcpMap["default"] {
+			if mcp.Name == mcpName {
+				found = true
+				break
+			}
+		}
+		if !found {
+			mcName := "00-" + mcp.Name + HwOffloadNodeLabel
+			foundMC := &mcfgv1.MachineConfig{}
+			err = r.Get(context.TODO(), types.NamespacedName{Name: mcName}, foundMC)
+			if err != nil {
+				if !errors.IsNotFound(err) {
+					err = r.Delete(context.TODO(), foundMC)
+					if err != nil {
+						return fmt.Errorf("Couldn't delete MachineConfig: %v", err)
+					}
+				}
+			}
+		}
+	}
+
 	return nil
 }
